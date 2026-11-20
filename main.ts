@@ -1,50 +1,89 @@
-// gta6-trophy-rarity-forecast-01: forecast each GTA VI (PS5) trophy's Exophase earn rate
-// at the case's target, as five quantiles (0.05/0.25/0.5/0.75/0.95) per trophy.
+// gta6-trophy-rarity-forecast-01 v2: forecast each GTA VI (PS5) trophy's Exophase earn
+// rate at the case's target, as five quantiles (0.05/0.25/0.5/0.75/0.95) per trophy.
 // Node 22, standard library only, fully deterministic: no randomness, no clock, no network.
 //
-// MODEL
-// Every trophy's rate decomposes into earners over tracked players: r_j(T) = 100 * E_j(T) / N(T).
-// The two move for different reasons, so they are forecast separately and divided.
+// MODEL (v2 — what changed vs v1 is marked [v2] below)
+// Every trophy's rate decomposes into earners over tracked players:
+//   r_j(T) = 100 * E_j(T) / N(T), forecast separately and divided.
 //
-// Reads: Exophase refreshes a game's counts on its own schedule, so consecutive reads are
-// often byte-identical. Consecutive identical reads (same rates AND same players_tracked)
-// collapse into one distinct read; only distinct reads and their times carry information.
+// DISTINCT READS [v2]: Exophase refreshes a game's counts on its own schedule, so
+// consecutive reads are often byte-identical. Consecutive identical reads (same rates
+// AND same players_tracked) collapse into one distinct read. A distinct read's state
+// was SET at its FIRST occurrence — the refresh just before the first read that shows
+// it — not at its last occurrence: dating a state at its last occurrence pretends a
+// state set hours earlier is current, which depresses early points most (a 3 h refresh
+// lag is a large fraction of h early on, a small one late) and bends every fit toward
+// stronger saturation. So distinct reads are dated at first occurrence here.
+// The FIRST distinct read is the pre-release state (638 tracked, launch-night earners):
+// it is not a state at its timestamp, so the N-fit drops it (see below).
 //
-// N(T) — players tracked: log N is fit by least squares against log(1 + hours since release)
-// over the distinct reads (the last 24 h of them when there are at least 3, else all),
-// extrapolated to the target hour, floored at the last N and capped at 30x the last N.
+// N(T) — players tracked [v2]: log N is NOT a straight line in log(1+h) over a week:
+// the tracked-player flood saturates. v1's power-law extrapolation overshot N(T) by
+// ~45% on simulated finals (its medians sat ~28% low on every trophy, uniformly).
+// So N is fit with the saturating form
+//   N(h) = C * (1+h)^a / (1 + (1+h)^a / S)
+// by a deterministic log-space grid search over (a, S) with log C solved by least
+// squares, on all distinct reads except the first (pre-release) one. On 80 simulated
+// launches the fit recovers a ~ 1.5 and S ~ 1500 and cuts the mean |log N(T) error|
+// from 0.45 (power law) to 0.04. When the fit cannot run (too few reads) or finds no
+// saturation (S at the grid edge), it falls back to v1's power law on the last 24 h.
+// N(T) is floored at the last N and capped at 30x it.
 //
-// E_j(T) — earners of trophy j: log(E_j + 0.5) is fit the same way over the distinct reads
-// with E_j > 0 (E_j = round(r_j / 100 * N)). Each trophy's slope is shrunk toward its
-// tier's mean slope, with weight by fit quality (more distinct reads with movement = more
-// weight on the raw slope). E_j(T) is extrapolated, floored at 0 and capped at N(T).
-// A trophy at >= 99.9% in the last read keeps a median of about 99.95%.
+// E_j(T) — earners of trophy j: log(E_j + 0.5) is fit against log(1+h) over the
+// distinct reads with E_j > 0 and h >= 3 (earner counts are frozen at their
+// launch-night values until ~h=3, so earlier reads carry no slope information).
+// Each trophy's slope is shrunk toward its tier's mean slope, weighted by fit quality
+// (more distinct reads with movement = more weight on the raw slope). (An earliness
+// blend was tried for the shrinkage target and dropped: on simulated finals it lost
+// to the plain tier mean, and with ~20 distinct reads the raw slopes already carry
+// most of the weight.) The shrunk slope pivots around the fit's centroid so
+// shrinkage never shifts the level the data pins down. E_j(T) is extrapolated,
+// floored at 0 and capped at N(T). A trophy at >= 99.9% in the last read keeps a
+// median of about 99.95% (the first trophy: earned within minutes of launching, so
+// essentially every tracked player has it — the rules record it staying at 100%
+// through the 04:30 refresh while every other rate fell).
 //
-// FLAT-HISTORY BRANCH (launch night): activates ONLY when the history holds exactly one
-// distinct read AND the case is within ~24 h of release. On launch night the page the
-// house read was stale — Exophase had not refreshed for hours — so the last read is not
-// the state at the checkpoint, it is the state at Exophase's previous refresh. The pending
-// refresh is modelled from the rules' own anchor: the page showed 638 players tracked
-// from 2026-11-18T23:48Z through the 04:00Z read, then 3,868 at 04:30Z, a ~6x jump over
-// ~1.5 h of clock from the last pre-refresh read. That is a staleness factor of ~3 on top
-// of the clock-ratio growth, hence:
-//   G_eff = (hours to target / hours to last read)^1.1 * 3,   N(T) = N_last * G_eff
-//   E_j(T) = E_j_last * (hours to target / hours to last read)^e_j
-// with e_j ~ 0.3 for most trophies (earners grow much slower than the tracked-player
-// flood early on — dilution dominates), ~1.0 for the earliest story trophies (ids 2-4,
-// which players reach within hours of starting), and 0 for the platinum (nobody can
-// plausibly earn it in the first hours). These are launch-night refresh priors from the
-// rules' 638 -> 3,868 anchor and generic launch dynamics, NOT values fitted to any answer.
+// EARLINESS PRIOR [v2]: a trophy's launch-night earner count E0_j (among the first
+// 638 tracked players) measures how early in a typical playthrough it is reached,
+// and early-reached trophies' earners grow fastest as new players start. So the
+// prior growth exponent is beta_j = 0.7 * (E0_j / E_med)^0.5, clipped to [0.15, 2.2],
+// where E_med is the median launch-night earner count and 0.7 is the centre of the
+// earner-growth exponents seen across trophies (the simulator's beta distribution,
+// median 0.7, is calibrated to the observed anchors). The platinum gets beta 0.25
+// (nobody plausibly earns it in week one). v1's crude buckets (0 / 1.0 for ids 2-4 /
+// 0.3 for the rest) underestimated fast-growing early trophies — the worst misses
+// in validation — and overestimated some mid-story ones; the smooth prior replaces
+// them in the flat branch, where no fit exists to learn growth from data.
 //
-// SPREAD (logit scale, per trophy): sigma_j = MULT * sqrt(sigma_rw^2 + sigma_fit^2 + sigma_N^2)
-//   sigma_rw  = 0.5 * sqrt(horizon in days)   (baseline-like random walk)
-//   sigma_fit = residual std of the trophy's E-fit (0.35 in the flat branch: no fit exists)
-//   sigma_N   = residual std of the N-fit     (0.6  in the flat branch: the refresh is unseen)
-// MULT is a global spread multiplier calibrated on held-out validation (see README);
-// the flat-history branch keeps its own unshrunk multiplier because it has no fit at all.
-// Quantiles: q_tau = 100 / (1 + exp(-(logit(median) + z_tau * sigma_j))),
-// z = [-1.645, -0.674, 0, 0.674, 1.645], rounded to 4 decimals, clamped to [0.01, 99.99],
-// forced non-decreasing.
+// FLAT-HISTORY BRANCH (launch night) [v2]: activates ONLY when the history holds
+// exactly one distinct read AND the target is within ~48 h of release. The single
+// read is the stale pre-release state, so the pending refresh is modelled from the
+// rules' own anchor (638 players tracked from 23:48Z through the 04:00Z read, then
+// 3,868 at 04:30Z):
+//   the stale state is the state at release (h ~ 0): N(h) = 638 * (1+h)^a with
+//   a = ln(3868/638) / ln(5.5) ~ 1.057, which reproduces the anchor exactly;
+//   the answer shows the state at the last refresh before the target: the first
+//   refresh is the anchor one (h = 4.5), later refreshes come ~every 3 h, so the
+//   state time is hState = 4.5 for targets up to ~6 h, else hT - 1.5 (the expected
+//   age of the last refresh), and 0 if the target precedes the first refresh;
+//   beyond the anchor, N continues with exponent 1.5 (the flood steepens past the
+//   anchor average as launch day progresses);
+//   E_j(hState) = E0_j * (hState/3)^beta_j with beta_j from the earliness prior.
+// These are launch-night refresh priors from the rules' anchor and generic launch
+// dynamics, NOT values fitted to any answer.
+//
+// SPREAD (logit scale, per trophy): sigma_j = MULT * sqrt(sigma_rw^2 + sigma_fit^2
+// + sigma_N^2), sigma_rw = 0.5 * sqrt(horizon in days) (baseline-like random walk),
+// sigma_fit from the E-fit residual, sigma_N from the N-fit residual, each floored
+// (0.15 / 0.1) so a suspiciously perfect fit on smooth data cannot claim zero
+// uncertainty. In the flat branch there is no fit at all, so both components are
+// horizon-dependent priors instead: sigma_fit grows with ln(hState/3) (a beta error
+// compounds with the growth horizon) and sigma_N grows past the anchor (the
+// continuation exponent is uncertain). MULT is 0.35 in the general branch and 1.0 in
+// the flat branch (no fit at all there). Quantiles:
+// q_tau = 100 / (1 + exp(-(logit(median) + z_tau * sigma_j))),
+// z = [-1.645, -0.674, 0, 0.674, 1.645], rounded to 4 decimals, clamped to
+// [0.01, 99.99], forced non-decreasing.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -58,21 +97,65 @@ const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 /** Random-walk spread, in logit units per square-root day (as in the house baseline). */
 const SIGMA_RW = 0.5;
-/** Global multiplier on the combined spread, calibrated on held-out validation
- *  (40 simulated launches at the final horizon: 0.4-0.5 is flat-optimal there, 0.5 kept
- *  for robustness to real-world fat tails the smooth simulator lacks). */
-const SPREAD_MULT = 0.5;
-/** The flat-history branch carries no fit at all — one stale read and an unseen refresh —
- *  so its spread stays unshrunk: on the real 13:18 check its pinball loss is lowest at 1.0. */
+/** General-branch multiplier on the combined spread. The simulator is smooth (no
+ *  day-to-day shocks, no refresh gaps over ~4 h, no model misspecification), so its
+ *  own optimum is narrower than this; 0.35 keeps a margin for the real final's
+ *  fatter tails while capturing most of the gain over v1's 0.5. */
+const SPREAD_MULT = 0.35;
+/** The flat-history branch carries no fit at all, so its spread stays unshrunk. */
 const FLAT_SPREAD_MULT = 1.0;
-/** Flat-branch priors when a single distinct read carries no fit information. */
-const FLAT_SIGMA_FIT = 0.35;
-const FLAT_SIGMA_N = 0.6;
-/** Fallback residual when a fit has too few points to measure one. */
+/** Flat-branch spread: the earliness prior's uncertainty compounds with the growth
+ *  horizon (a beta error of sd ~0.6 moves log E by 0.6 * ln(hState/3)), on top of a
+ *  base level uncertainty; the N model's uncertainty grows past the anchor as the
+ *  continuation exponent is uncertain. Both are horizon-dependent, not constants. */
+const flatSigmaFit = (hState: number): number =>
+  0.2 + 0.6 * Math.log(Math.max(1, hState / 3));
+const flatSigmaN = (hState: number): number =>
+  0.1 + 0.3 * Math.log(Math.max(1, (1 + hState) / (1 + ANCHOR_H_REFRESH)));
+/** Floors so a near-perfect fit on smooth data cannot claim zero uncertainty. */
+const FLOOR_SIGMA_FIT = 0.15;
+const FLOOR_SIGMA_N = 0.1;
+/** Fallback residuals when a fit has too few points to measure one. */
 const DEFAULT_SIGMA_FIT = 0.3;
 const DEFAULT_SIGMA_N = 0.3;
 /** Release origin if the case carries no usable release_date. */
 const FALLBACK_ORIGIN_MS = Date.UTC(2026, 10, 19, 0, 0, 0);
+
+/** Rules' anchor: the stale launch-night page showed this many players tracked ... */
+const ANCHOR_N_STALE = 638;
+/** ... and the first refresh, at this hour after release, showed this many. */
+const ANCHOR_N_REFRESH = 3868;
+const ANCHOR_H_REFRESH = 4.5;
+/** N-growth exponent implied by the anchor: ln(3868/638) / ln(1 + 4.5). */
+const ANCHOR_A = Math.log(ANCHOR_N_REFRESH / ANCHOR_N_STALE) / Math.log(1 + ANCHOR_H_REFRESH);
+/** N-growth exponent past the anchor (the flood steepens past the anchor average as
+ *  launch day progresses: the saturating N law's early exponent is ~1.5, recovered
+ *  independently by the general branch's saturating fit on simulated finals). */
+const ANCHOR_A_LATE = 1.5;
+/** Expected age, in hours, of the last refresh before a target well past the first. */
+const REFRESH_LAG_H = 1.5;
+/** Earliness prior: centre of the earner-growth exponents across trophies. */
+const PRIOR_BETA0 = 0.7;
+/** Earliness prior: exponent on (E0_j / E_med); 0.5 means the launch-night earner
+ *  spread maps weakly onto the growth-exponent spread — the signal is real (the
+ *  earliest-reached trophies grow fastest) but noisy (same-count trophies grow very
+ *  differently), so the prior differentiates without betting the median on it. */
+const PRIOR_BETA_K = 0.5;
+const PRIOR_BETA_MIN = 0.15;
+const PRIOR_BETA_MAX = 2.2;
+/** Platinum growth exponent (nobody plausibly earns it in week one). */
+const BETA_PLATINUM = 0.25;
+/** Saturating N-fit: grid over a and S (log-spaced), log C solved by least squares. */
+const SAT_A_MIN = 0.8;
+const SAT_A_MAX = 2.3;
+const SAT_A_STEPS = 76;
+const SAT_S_MIN = 200;
+const SAT_S_MAX = 50000;
+const SAT_S_STEPS = 60;
+/** Above this S the data show no saturation: fall back to the power law. */
+const SAT_S_FALLBACK = 20000;
+/** Minimum distinct reads (after dropping the pre-release one) for the saturating fit. */
+const SAT_MIN_READS = 6;
 
 interface Trophy {
   id: number;
@@ -101,6 +184,13 @@ const logit = (pct: number): number => {
 };
 /** x rounded to 4 decimals. */
 const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
+/** Median of numbers (0 when empty). */
+const median = (xs: number[]): number => {
+  if (xs.length === 0) return 0;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 === 1 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
 
 /** Least squares of y on x. Returns slope, intercept, residual std (0 if < 3 points),
  *  and the centroid (mx, my) so a shrunk slope can pivot around the data, not around x=0. */
@@ -141,6 +231,51 @@ function hoursSinceOrigin(ms: number, originMs: number): number {
   return Math.max(-0.9, (ms - originMs) / 3_600_000);
 }
 
+/**
+ * Saturating N-fit: N(h) = C * (1+h)^a / (1 + (1+h)^a / S), fit in log space.
+ * Grid-searches (a, S); log C is solved by least squares for each pair. Returns the
+ * fitted (a, S, logC) and the log-space residual std, or null when there are too few
+ * points or the best fit sits at the no-saturation edge (S >= SAT_S_FALLBACK).
+ */
+function saturatingNFit(
+  hs: number[],
+  ns: number[],
+): { a: number; s: number; logC: number; resid: number } | null {
+  if (hs.length < SAT_MIN_READS) return null;
+  const xs = hs.map((h) => Math.log(1 + h));
+  const logN = ns.map((n) => Math.log(Math.max(1, n)));
+  let best: { ss: number; a: number; s: number; logC: number } | null = null;
+  for (let ai = 0; ai < SAT_A_STEPS; ai++) {
+    const a = SAT_A_MIN + ((SAT_A_MAX - SAT_A_MIN) * ai) / (SAT_A_STEPS - 1);
+    for (let si = 0; si < SAT_S_STEPS; si++) {
+      const s = Math.exp(Math.log(SAT_S_MIN) + ((Math.log(SAT_S_MAX) - Math.log(SAT_S_MIN)) * si) / (SAT_S_STEPS - 1));
+      // log N_pred = logC + a*x - log(1 + (1+h)^a / S); logC = mean(logN - base).
+      let logC = 0;
+      const base: number[] = new Array(hs.length);
+      for (let i = 0; i < hs.length; i++) {
+        base[i] = a * xs[i] - Math.log(1 + Math.pow(1 + hs[i], a) / s);
+        logC += logN[i] - base[i];
+      }
+      logC /= hs.length;
+      let ss = 0;
+      for (let i = 0; i < hs.length; i++) {
+        const r = logN[i] - (logC + base[i]);
+        ss += r * r;
+      }
+      if (best === null || ss < best.ss) best = { ss, a, s, logC };
+    }
+  }
+  if (best === null || best.s >= SAT_S_FALLBACK) return null;
+  const resid = hs.length >= 4 ? Math.sqrt(best.ss / (hs.length - 3)) : 0;
+  return { a: best.a, s: best.s, logC: best.logC, resid };
+}
+
+/** N at hour h under a saturating fit. */
+function saturatingNAt(fit: { a: number; s: number; logC: number }, h: number): number {
+  const p = Math.pow(1 + h, fit.a);
+  return Math.exp(fit.logC) * p / (1 + p / fit.s);
+}
+
 function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
   const originMs = c.game?.release_date ? Date.parse(`${c.game.release_date}T00:00:00Z`) : NaN;
   const origin = Number.isFinite(originMs) ? originMs : FALLBACK_ORIGIN_MS;
@@ -149,11 +284,8 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
   const horizonDays = c.horizon_minutes / 1440;
   const sigmaRw = SIGMA_RW * Math.sqrt(horizonDays);
 
-  // Collapse consecutive identical reads into distinct reads (same rates AND same N).
-  // A distinct read's time is the LAST read that showed that state: the state was still
-  // current then, and the checkpoint-adjacent time is what the forecast extrapolates from.
-  // (Keeping the first occurrence would date a launch-night read to 23:50 and wildly
-  // overstate how stale it is.)
+  // Collapse consecutive identical reads into distinct reads (same rates AND same N),
+  // dated at their FIRST occurrence: the state was set at the refresh just before it.
   const distinct: Read[] = [];
   for (const r of c.history) {
     const prev = distinct[distinct.length - 1];
@@ -163,7 +295,6 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
       prev.rates.length === r.rates.length &&
       prev.rates.every((v, i) => v === r.rates[i])
     ) {
-      prev.at = r.at;
       continue;
     }
     distinct.push({ ...r, rates: [...r.rates] });
@@ -171,45 +302,83 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
   const last = distinct[distinct.length - 1];
   const lastRates = last.rates;
   const nLast = last.players_tracked;
-  const hLast = Math.max(0.25, hoursSinceOrigin(Date.parse(last.at), origin));
+
+  // Launch-night earner counts (first distinct read) and their median, for the
+  // earliness prior. Id 2's 100% rate (E0 = N) is excluded: it is handled separately.
+  const e0: number[] = c.trophies.map((t, j) => {
+    const r = distinct[0].rates[j];
+    if (r === null || r >= 99.9) return 0;
+    return Math.round((r / 100) * distinct[0].players_tracked);
+  });
+  const eMed = Math.max(1, median(e0.filter((e) => e > 0)));
+  const priorBeta = (j: number): number => {
+    if (c.trophies[j].id === 1) return BETA_PLATINUM;
+    if (e0[j] <= 0) return PRIOR_BETA0;
+    const b = PRIOR_BETA0 * Math.pow(e0[j] / eMed, PRIOR_BETA_K);
+    return Math.min(PRIOR_BETA_MAX, Math.max(PRIOR_BETA_MIN, b));
+  };
 
   const medians: number[] = new Array(c.trophies.length).fill(0);
   const sigmas: number[] = new Array(c.trophies.length).fill(0);
 
-  if (distinct.length === 1 && hLast <= 24) {
-    // ---- Flat-history branch: the single read is stale; model the pending refresh. ----
-    const ratio = Math.max(1, hTarget / hLast);
-    const gEff = Math.pow(ratio, 1.1) * 3;
-    const nTarget = nLast * gEff;
+  if (distinct.length === 1 && hTarget <= 48) {
+    // ---- Flat-history branch: the single read is the stale pre-release state. ----
+    // The answer shows the state at the last refresh before the target: the first
+    // refresh is the rules' anchor one (h = 4.5); later ones come ~every 3 h.
+    const hState = hTarget < 4.0 ? 0 : hTarget <= ANCHOR_H_REFRESH ? ANCHOR_H_REFRESH : Math.max(ANCHOR_H_REFRESH, hTarget - REFRESH_LAG_H);
+    let nTarget: number;
+    if (hState <= ANCHOR_H_REFRESH) {
+      nTarget = ANCHOR_N_STALE * Math.pow(1 + hState, ANCHOR_A);
+    } else {
+      nTarget =
+        ANCHOR_N_REFRESH * Math.pow((1 + hState) / (1 + ANCHOR_H_REFRESH), ANCHOR_A_LATE);
+    }
     for (let j = 0; j < c.trophies.length; j++) {
-      const id = c.trophies[j].id;
       const lastRate = lastRates[j] ?? 0;
       if (lastRate >= 99.9) {
         medians[j] = 99.95;
       } else {
         const eLast = Math.round((lastRate / 100) * nLast);
-        const e = id === 1 ? 0 : id >= 2 && id <= 4 ? 1.0 : 0.3;
-        const eTarget = eLast * Math.pow(ratio, e);
-        medians[j] = (100 * eTarget) / nTarget;
+        const eTarget = hState <= 3 ? eLast : eLast * Math.pow(hState / 3, priorBeta(j));
+        medians[j] = (100 * Math.min(eTarget, nTarget)) / nTarget;
       }
       sigmas[j] =
-        FLAT_SPREAD_MULT * Math.sqrt(sigmaRw * sigmaRw + FLAT_SIGMA_FIT * FLAT_SIGMA_FIT + FLAT_SIGMA_N * FLAT_SIGMA_N);
+        FLAT_SPREAD_MULT *
+        Math.sqrt(sigmaRw * sigmaRw + flatSigmaFit(hState) * flatSigmaFit(hState) + flatSigmaN(hState) * flatSigmaN(hState));
     }
   } else {
     // ---- General branch: fit N and each E_j in log-log time. ----
     const xsAll = distinct.map((r) => Math.log(1 + hoursSinceOrigin(Date.parse(r.at), origin)));
-    // Last 24 h of distinct reads when there are at least 3, else all of them.
-    const cutoffMs = Date.parse(last.at) - 24 * 3_600_000;
-    const recentIdx = distinct.map((r, i) => i).filter((i) => Date.parse(distinct[i].at) >= cutoffMs);
-    const nIdx = recentIdx.length >= 3 ? recentIdx : distinct.map((_, i) => i);
-    const nFit = linfit(
-      nIdx.map((i) => xsAll[i]),
-      nIdx.map((i) => Math.log(Math.max(1, distinct[i].players_tracked))),
-    );
+    const hsAll = distinct.map((r) => hoursSinceOrigin(Date.parse(r.at), origin));
     const xTarget = Math.log(1 + hTarget);
-    let nTarget = Math.exp(nFit.intercept + nFit.slope * xTarget);
+
+    // N(T): saturating fit on all distinct reads except the first (pre-release state),
+    // else the power law on the last 24 h of reads (v1's fit).
+    let nTarget: number;
+    let sigmaN: number;
+    const satRows = distinct.slice(1);
+    const satFit =
+      satRows.length >= SAT_MIN_READS
+        ? saturatingNFit(
+            satRows.map((r) => hoursSinceOrigin(Date.parse(r.at), origin)),
+            satRows.map((r) => r.players_tracked),
+          )
+        : null;
+    if (satFit !== null) {
+      nTarget = saturatingNAt(satFit, hTarget);
+      sigmaN = Math.max(FLOOR_SIGMA_N, satFit.resid);
+    } else {
+      const cutoffMs = Date.parse(last.at) - 24 * 3_600_000;
+      const recentIdx = distinct.map((r, i) => i).filter((i) => Date.parse(distinct[i].at) >= cutoffMs);
+      const nIdx = recentIdx.length >= 3 ? recentIdx : distinct.map((_, i) => i);
+      const nFit = linfit(
+        nIdx.map((i) => xsAll[i]),
+        nIdx.map((i) => Math.log(Math.max(1, distinct[i].players_tracked))),
+      );
+      nTarget = Math.exp(nFit.intercept + nFit.slope * xTarget);
+      sigmaN = nIdx.length >= 3 ? Math.max(FLOOR_SIGMA_N, nFit.resid) : DEFAULT_SIGMA_N;
+    }
     nTarget = Math.min(30 * nLast, Math.max(nLast, nTarget));
-    const sigmaN = nIdx.length >= 3 ? nFit.resid : DEFAULT_SIGMA_N;
 
     // Per-trophy E fits and tier mean slopes for shrinkage.
     const rawSlopes: Array<number | null> = [];
@@ -220,6 +389,8 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
     for (let j = 0; j < c.trophies.length; j++) {
       const xs: number[] = [];
       const ys: number[] = [];
+      const xsLate: number[] = [];
+      const ysLate: number[] = [];
       for (let i = 0; i < distinct.length; i++) {
         const r = distinct[i].rates[j];
         if (r === null) continue;
@@ -227,11 +398,19 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
         if (e > 0) {
           xs.push(xsAll[i]);
           ys.push(Math.log(e + 0.5));
+          // Earner counts are frozen at launch-night values until ~h=3, so only
+          // reads from h>=3 carry slope information; use them when there are >= 2.
+          if (hsAll[i] >= 3) {
+            xsLate.push(xsAll[i]);
+            ysLate.push(Math.log(e + 0.5));
+          }
         }
       }
-      fitCounts.push(xs.length);
-      if (xs.length >= 2) {
-        const f = linfit(xs, ys);
+      const useXs = xsLate.length >= 2 ? xsLate : xs;
+      const useYs = xsLate.length >= 2 ? ysLate : ys;
+      fitCounts.push(useXs.length);
+      if (useXs.length >= 2) {
+        const f = linfit(useXs, useYs);
         rawSlopes.push(f.slope);
         fitMx.push(f.mx);
         fitMy.push(f.my);
@@ -261,7 +440,7 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
           nAll++;
         }
       }
-      return nAll > 0 ? sAll / nAll : 0.3;
+      return nAll > 0 ? sAll / nAll : PRIOR_BETA0;
     };
     const tierResid = (tier: string): number => {
       let s = 0;
@@ -288,11 +467,15 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
       if (rawSlopes[j] !== null && fitMx[j] !== null && fitMy[j] !== null) {
         const m = fitCounts[j];
         const w = m / (m + 2); // more distinct reads with movement -> more weight on the raw slope
-        const slope = w * (rawSlopes[j] as number) + (1 - w) * tierMeanSlope(tier);
+        // Shrink toward the tier mean slope (ablation: earliness blend removed —
+        // on simulated finals it did not beat the tier mean, and the raw slopes
+        // already carry most of the weight with ~20 distinct reads).
+        const target = tierMeanSlope(tier);
+        const slope = w * (rawSlopes[j] as number) + (1 - w) * target;
         // Pivot the shrunk slope around the fit's centroid, not around x=0: shrinking
         // the slope must not shift the level the data itself pins down.
         eTarget = Math.exp((fitMy[j] as number) + slope * (xTarget - (fitMx[j] as number))) - 0.5;
-        sigmaFit = fitCounts[j] >= 3 ? (fitResids[j] as number) : tierResid(tier);
+        sigmaFit = fitCounts[j] >= 3 ? Math.max(FLOOR_SIGMA_FIT, fitResids[j] as number) : tierResid(tier);
       } else {
         // Never earned in any distinct read: half an earner, growing like the tier.
         eTarget = 0.5 * Math.pow(Math.max(1, nTarget / nLast), 0.3);
